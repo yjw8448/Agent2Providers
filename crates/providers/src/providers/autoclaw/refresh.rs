@@ -64,13 +64,14 @@ const AUTH_APP_KEY: &str = "38d2391985e2369a5fb8227d8e6cd5e5";
 /// 服务端按 `X-Version` 对 `autoclaw-model-config` 做**版本门控**：同一个账号、
 /// 同一个 URL，不带这个头时国际版只下发 4 条（缺 `tdpsk_deepseek-v4-flash-202605`
 /// 与 `zai_glm-5.3-flash`）、国内版只下发 3 条（缺 `zai_glm-5.3-flash`）；补上
-/// `X-Version: 1.18.5`（本机桌面端当前版本，两地实测同值放行）后两地都下发
+/// `X-Version: 2.1.1`（本机桌面端当前版本，两地实测同值放行）后两地都下发
 /// 全量目录。客户端在**所有** userapi 请求上都发它（`commonHeaders` 包着
 /// `authHeaders`），所以这里跟着签名头一起发，而不是只给目录请求加。
 ///
-/// 值跟着**真实客户端**走：客户端自动更新后这里会过时，过时的症状是目录
-/// 回落成旧清单而不是报错 —— 到时候改这一个常量即可。
-const CLIENT_VERSION: &str = "1.18.5";
+/// 值跟着**真实客户端**走：客户端自动更新后这里会过时，过时的症状可能是目录
+/// 回落成旧清单，**也可能是刷新接口被版本门控判拒**（国内版 24h Token 刷新
+/// 失败 → 账号静默过期）—— 到时候改这一个常量即可。
+const CLIENT_VERSION: &str = "2.1.1";
 
 // ─── 单飞表 ─────────────────────────────────────────────────
 
@@ -315,13 +316,18 @@ async fn call_refresh_api(
         "refresh_token": credentials.refresh_token,
         "source_id": "autoclaw",
     });
-    if !credentials.device_id.is_empty() {
-        if let Some(map) = body.as_object_mut() {
-            map.insert(
-                "device_id".to_string(),
-                Value::String(credentials.device_id.clone()),
-            );
-        }
+    // magpie 总是带 device_id（fallback 链：credential.device_id ??
+    // jwtDeviceId(token) ?? 'dsh-autoclaw-device-001'）。`credentials_from_claims`
+    // 已把 JWT 里的 device_id 补进 credentials.device_id，到这一步仍为空只可能是
+    // 记录与 JWT 都没有 —— 此时照 magpie 发固定兜底值，而不是不发（空 device_id
+    // 是偶发刷新失败的一个来源）。
+    let device_id = if credentials.device_id.is_empty() {
+        "dsh-autoclaw-device-001".to_string()
+    } else {
+        credentials.device_id.clone()
+    };
+    if let Some(map) = body.as_object_mut() {
+        map.insert("device_id".to_string(), Value::String(device_id));
     }
     let response = send_raw(
         "POST",
@@ -405,11 +411,18 @@ async fn call_refresh_api_with_fallback(
         credentials.origin,
         credentials.cache_key.clone(),
     );
-    // JWT 解不出 exp 时保留旧的过期时间（与 raccoon 的
-    // `or(credentials.expires_at)` 同一取舍）
-    if next.expires_at.is_none() {
-        next.expires_at = credentials.expires_at;
-    }
+    // 优先用刷新响应里直给的 expires_at（magpie 同款：d?.expires_at ?? d?.expiresAt）。
+    // 国内版 24h Access Token 常为非 JWT / 不带 exp：只信 JWT `exp` 会让
+    // `expires_at` 恒为 None → `is_expiring()` 永远 false（永不主动刷新）、
+    // `persist_refresh` 永不写 `expiresAt`（needsRelogin 永远 false，静默过期）。
+    // 秒级（<1e12）归一为毫秒（与 magpie 的 `rawExp >= 1e12 ? rawExp : rawExp * 1000` 一致）。
+    let response_expires = data
+        .get("expires_at")
+        .or_else(|| data.get("expiresAt"))
+        .and_then(number_value)
+        .filter(|value| *value > 0.0)
+        .map(|value| if value >= 1e12 { value } else { value * 1000.0 });
+    next.expires_at = response_expires.or(next.expires_at).or(credentials.expires_at);
     if next.user_id.is_empty() {
         next.user_id = credentials.user_id.clone();
     }
