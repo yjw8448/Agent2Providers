@@ -1,0 +1,69 @@
+name: build-fork-aarch64
+
+# ── 给 fork 用的 aarch64 编译 / 打包 workflow ───────────────────────────────
+# 主仓库的 release.yml 只做「派发到官方构建仓库」，fork 上没有
+# BUILDER_DISPATCH_TOKEN、派发目标也不对，跑不了。本文件在 fork 上**真正
+# 交叉编译** aarch64 并打包成可直接导入的 zip。
+#
+# 不需要任何 secret：fork 拿不到官方签名私钥，出来的包是「未签名」状态，
+# 但网关允许安装（界面标黄）——见 .github/actions/sign-pack/action.yml 注释。
+#
+# 用法：把本文件 push 到 fork 后，到 Actions 标签手动 Run workflow 即可。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '包版本号（需与 pack.json 的 version 一致，默认 3.4.2）'
+        required: false
+        default: '3.4.2'
+        type: string
+  # 可选：打 v* tag 时也触发（但不派发，自己编）
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust（含 aarch64 目标）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: 安装 aarch64 交叉链接器
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: 交叉编译 providers 插件（aarch64）
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          # 若报 openssl / native-tls 相关错误，可改用 rustls 或在此处理 vcpkg；
+          # 多数情况下 providers 插件走纯 rustls，无需系统 openssl。
+          PKG_CONFIG_ALLOW_CROSS: '1'
+        run: |
+          set -euo pipefail
+          cargo build --release --target aarch64-unknown-linux-gnu -p agent2api-providers
+
+      - name: 安装 Node（跑 pack.mjs）
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 打包成 zip（不重编，用上一步的交叉产物）
+        run: |
+          set -euo pipefail
+          node scripts/pack.mjs --target aarch64-unknown-linux-gnu --skip-build
+
+      - name: 上传 zip 产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-providers-aarch64
+          path: dist/*.zip
+          if-no-files-found: error
