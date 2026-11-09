@@ -1,14 +1,17 @@
 name: build-fork-aarch64
 
 # ── 给 fork 用的 aarch64 编译 / 打包 workflow ───────────────────────────────
-# 主仓库的 release.yml 只做「派发到官方构建仓库」，fork 上没有
-# BUILDER_DISPATCH_TOKEN、派发目标也不对，跑不了。本文件在 fork 上**真正
-# 交叉编译** aarch64 并打包成可直接导入的 zip。
+# 这个 fork 的 Actions 权限被设为「只允许 yjw8448 自己仓库里的 action」，
+# 所以 actions/checkout、dtolnay/rust-toolchain、actions/setup-node、
+# actions/upload-artifact 等第三方 action 全部被拒（run 卡在 queued）。
+# 本文件**完全不用任何第三方 action**：
+#   - 检出：git clone（用 GITHUB_TOKEN）
+#   - Rust：rustup 官方安装脚本
+#   - Node：GitHub runner 自带（ubuntu-latest 预装 node）
+#   - 上传：gh CLI（runner 自带）创建 Release 并上传 asset
+# 产物是「未签名」包，但网关允许安装（界面标黄）——见 sign-pack action 注释。
 #
-# 不需要任何 secret：fork 拿不到官方签名私钥，出来的包是「未签名」状态，
-# 但网关允许安装（界面标黄）——见 .github/actions/sign-pack/action.yml 注释。
-#
-# 用法：把本文件 push 到 fork 后，到 Actions 标签手动 Run workflow 即可。
+# 用法：push 到 fork 默认分支后，Actions 标签手动 Run workflow。
 
 on:
   workflow_dispatch:
@@ -18,52 +21,68 @@ on:
         required: false
         default: '3.4.2'
         type: string
-  # 可选：打 v* tag 时也触发（但不派发，自己编）
   push:
     tags:
       - 'v*'
+
+# GITHUB_TOKEN 需要写权限才能建 Release / 推 tag
+permissions:
+  contents: write
 
 jobs:
   build-aarch64:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 安装 Rust（含 aarch64 目标）
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-
-      - name: 安装 aarch64 交叉链接器
+      - name: 安装交叉链接器 + git
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          sudo apt-get install -y gcc-aarch64-linux-gnu git
+
+      - name: 安装 Rust 工具链（rustup，带 aarch64 目标）
+        run: |
+          set -euo pipefail
+          if ! command -v cargo >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+          fi
+          source "$HOME/.cargo/env"
+          rustup target add aarch64-unknown-linux-gnu
+          cargo --version
+          rustc --version
+
+      - name: 检出代码（git clone，不用 actions/checkout）
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch main "https://x-access-token:${TOKEN}@github.com/yjw8448/Agent2Providers.git" repo
 
       - name: 交叉编译 providers 插件（aarch64）
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          # 若报 openssl / native-tls 相关错误，可改用 rustls 或在此处理 vcpkg；
-          # 多数情况下 providers 插件走纯 rustls，无需系统 openssl。
           PKG_CONFIG_ALLOW_CROSS: '1'
         run: |
           set -euo pipefail
+          source "$HOME/.cargo/env"
+          cd repo
           cargo build --release --target aarch64-unknown-linux-gnu -p agent2api-providers
 
-      - name: 安装 Node（跑 pack.mjs）
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: 打包成 zip（不重编，用上一步的交叉产物）
+      - name: 打包成 zip（node pack.mjs，不重编、不签名）
         run: |
           set -euo pipefail
+          cd repo
+          node --version
           node scripts/pack.mjs --target aarch64-unknown-linux-gnu --skip-build
 
-      - name: 上传 zip 产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: agent2api-providers-aarch64
-          path: dist/*.zip
-          if-no-files-found: error
+      - name: 上传产物为 Release asset（gh CLI，不用 upload-artifact）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: build-aarch64-${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          cd repo
+          ZIP=$(ls dist/*.zip | head -1)
+          echo "uploading: $ZIP"
+          gh release create "$TAG" "$ZIP" \
+            --title "AutoClaw fix build ${TAG}" \
+            --notes "未签名 aarch64 providers 构建：CLIENT_VERSION 2.1.1 + expires_at 回灌修复。agent2api 界面导入（未签名，界面标黄可装）。"
