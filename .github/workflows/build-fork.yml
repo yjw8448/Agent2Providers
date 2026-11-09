@@ -7,8 +7,15 @@ name: build-fork-aarch64
 # 本文件**完全不用任何第三方 action**：
 #   - 检出：git clone（用 GITHUB_TOKEN）
 #   - Rust：rustup 官方安装脚本
-#   - Node：GitHub runner 自带（ubuntu-latest 预装 node）
+#   - 打包：node pack.mjs（runner 自带 node）
 #   - 上传：gh CLI（runner 自带）创建 Release 并上传 asset
+#
+# 编译目标：aarch64-unknown-linux-musl（完全静态，不依赖宿主机 glibc）。
+# 原因：之前用 aarch64-unknown-linux-gnu 在 ubuntu-latest（glibc 2.39）编出的
+# 二进制要求 GLIBC_2.39，而用户 NAS 容器是 glibc 2.36 → 启动即崩（退出码 1）。
+# 改用 zigbuild 编 musl 静态后，产物可在任意 aarch64 Linux 上运行。
+# zig 自带 C 交叉编译，能编 rusqlite(bundled) 的 SQLite C 代码。
+#
 # 产物是「未签名」包，但网关允许安装（界面标黄）——见 sign-pack action 注释。
 #
 # 用法：push 到 fork 默认分支后，Actions 标签手动 Run workflow。
@@ -33,22 +40,28 @@ jobs:
   build-aarch64:
     runs-on: ubuntu-latest
     steps:
-      - name: 安装交叉链接器 + git
+      - name: 安装 git + python（zigbuild 通过 pip 装）
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu git
+          sudo apt-get install -y git python3 python3-pip
 
-      - name: 安装 Rust 工具链（rustup，带 aarch64 目标）
+      - name: 安装 Rust 工具链（rustup，带 musl 目标）
         run: |
           set -euo pipefail
           if ! command -v cargo >/dev/null 2>&1; then
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
           fi
           source "$HOME/.cargo/env"
-          rustup target add aarch64-unknown-linux-gnu
+          rustup target add aarch64-unknown-linux-musl
           cargo --version
           rustc --version
+
+      - name: 安装 cargo-zigbuild（静态 musl 交叉编译，自带 C 编译）
+        run: |
+          set -euo pipefail
+          pip3 install --user cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: 检出代码（git clone，不用 actions/checkout）
         env:
@@ -57,15 +70,24 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch main "https://x-access-token:${TOKEN}@github.com/yjw8448/Agent2Providers.git" repo
 
-      - name: 交叉编译 providers 插件（aarch64）
+      - name: 交叉编译 providers 插件（aarch64 musl 静态）
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: '1'
+          CARGO_ZIGBUILD_USE_LTO: '1'
         run: |
           set -euo pipefail
           source "$HOME/.cargo/env"
           cd repo
-          cargo build --release --target aarch64-unknown-linux-gnu -p agent2api-providers
+          cargo zigbuild --target aarch64-unknown-linux-musl --release -p agent2api-providers
+          ls -la target/aarch64-unknown-linux-musl/release/agent2api-providers
+
+      - name: 把 musl 二进制放到 gnu 路径，供 pack.mjs 打包
+        run: |
+          set -euo pipefail
+          cd repo
+          mkdir -p target/aarch64-unknown-linux-gnu/release
+          cp target/aarch64-unknown-linux-musl/release/agent2api-providers \
+             target/aarch64-unknown-linux-gnu/release/agent2api-providers
+          file target/aarch64-unknown-linux-gnu/release/agent2api-providers
 
       - name: 打包成 zip（node pack.mjs，不重编、不签名）
         run: |
@@ -85,4 +107,4 @@ jobs:
           echo "uploading: $ZIP"
           gh release create "$TAG" "$ZIP" \
             --title "AutoClaw fix build ${TAG}" \
-            --notes "未签名 aarch64 providers 构建：CLIENT_VERSION 2.1.1 + expires_at 回灌修复。agent2api 界面导入（未签名，界面标黄可装）。"
+            --notes "未签名 aarch64(musl 静态) providers 构建：CLIENT_VERSION 2.1.1 + expires_at 回灌修复。agent2api 界面导入（未签名，界面标黄可装）。"
