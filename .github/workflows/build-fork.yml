@@ -70,14 +70,21 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch main "https://x-access-token:${TOKEN}@github.com/yjw8448/Agent2Providers.git" repo
 
-      - name: 交叉编译 providers 插件（aarch64 musl 静态）
+      # ── 只编 autoclaw 这一个 feature ──────────────────────────────────────
+      # 仓库给每家都做了 cfg(feature) 条件编译（mod.rs / registry() 逐行
+      # #[cfg(feature="...")]）。--no-default-features --features autoclaw 会让
+      # 其他 32 家代码**完全不进二进制**，产物只剩 autoclaw 国内版/国际版。
+      # 再叠 --config profile.release.strip=true 砍掉符号表，进一步缩小体积。
+      - name: 交叉编译 autoclaw 单家插件（aarch64 musl 静态，仅 autoclaw feature）
         env:
           CARGO_ZIGBUILD_USE_LTO: '1'
         run: |
           set -euo pipefail
           source "$HOME/.cargo/env"
           cd repo
-          cargo zigbuild --target aarch64-unknown-linux-musl --release -p agent2api-providers
+          cargo zigbuild --target aarch64-unknown-linux-musl --release -p agent2api-providers \
+            --no-default-features --features autoclaw \
+            --config profile.release.strip=true
           ls -la target/aarch64-unknown-linux-musl/release/agent2api-providers
 
       - name: 把 musl 二进制放到 gnu 路径，供 pack.mjs 打包
@@ -106,5 +113,5 @@ jobs:
           ZIP=$(ls dist/*.zip | head -1)
           echo "uploading: $ZIP"
           gh release create "$TAG" "$ZIP" \
-            --title "AutoClaw fix build ${TAG}" \
-            --notes "未签名 aarch64(musl 静态) providers 构建：CLIENT_VERSION 2.1.1 + expires_at 回灌修复。agent2api 界面导入（未签名，界面标黄可装）。"
+            --title "AutoClaw 单家插件 ${TAG}" \
+            --notes "未签名 aarch64(musl 静态) **仅 autoclaw** 构建：--no-default-features --features autoclaw，其他 32 家不进二进制；含 CLIENT_VERSION 2.1.1 + expires_at 回灌修复。pack.json 已只暴露 autoclaw 国内版/国际版。agent2api 界面导入（未签名，界面标黄可装）。"
