@@ -691,9 +691,19 @@ async fn persist_refresh(
     }
     let account_id = refreshed.id.as_str();
     let record = crate::store::record(ctx, refreshed.region.provider_id(), account_id).await?;
-    // 记录里必须仍是刷新前那份凭证，否则说明别处已经换过（不回写）
-    let current_token = crate::store::pick(&record, &["token", "accessToken"]);
-    let current_refresh = crate::store::pick(&record, &["refreshToken"]);
+    // 记录里必须仍是刷新前那份凭证，否则说明别处已经换过（不回写）。
+    //
+    // ── Bearer 前缀口径必须与 `previous` 对齐（issue #561 修复 6）───────
+    // `previous` 出自 `credentials_from_record`，已经 `strip_bearer`（裸 JWT）；
+    // 而 `store::pick` 取的是落库原文 —— 插件登录响应原样落库的 token 自带
+    // `Bearer ` 前缀（`build_chat` 取 token 时剥前缀的注释记录了同一事实）。
+    // 不剥的话两侧恒不相等 → 每次都误判「凭据已被别处更换」→ 直接返回不写库，
+    // 刷新结果只在内存生效，账号库停在登录时刻；access token 固定 24h 寿命，
+    // 到期上游作废会话，只能重新登录续命 —— 每 24 小时必掉线的实际根因
+    // （issue #529 / ProvidersPlugin #22）。`strip_bearer` 对裸值是恒等变换，
+    // 落库已是裸值的记录不受影响；并发保护语义（比较-再写）原样保留。
+    let current_token = normalized_store_token(&record, &["token", "accessToken"]);
+    let current_refresh = normalized_store_token(&record, &["refreshToken"]);
     if current_token != previous.token || current_refresh != previous.refresh_token {
         if current_token.is_empty() {
             return Err(GatewayError::with_status(409, "AutoClaw 续期时账号凭据发生变化，请重新登录"));
@@ -726,11 +736,24 @@ async fn persist_refresh(
         return Ok(refreshed.token.clone());
     }
     let latest = crate::store::record(ctx, refreshed.region.provider_id(), account_id).await?;
-    let token = crate::store::pick(&latest, &["token", "accessToken"]);
+    // 重读校验同样剥 `Bearer ` 前缀再比较（口径与上面守门一致）：不剥的话
+    // 「落库仍是旧值」这个失败形态永远检测不到（旧值带前缀、previous 不带，
+    // 恒不相等 → 恒判成功），而且会把带前缀的原文当 token 返回给调用方，
+    // 调用方再拿它拼 `Bearer ` 头就成了 `Bearer Bearer …`。
+    let token = normalized_store_token(&latest, &["token", "accessToken"]);
     if token.is_empty() || token == previous.token {
         return Err(GatewayError::with_status(409, "AutoClaw 续期结果未能落盘，请重新登录该账号"));
     }
     Ok(token)
+}
+
+/// 落库取值 + Bearer 前缀规范化（[`persist_refresh`] 的守门比较与重读校验共用）。
+///
+/// `store::pick` 负责选键与去空白，`strip_bearer` 负责把「登录响应原样落库」
+/// 携带的 `Bearer ` 前缀剥成与 `credentials_from_record`（即 `previous`）一致的
+/// 裸 token 口径。两侧口径一致，比较-再写的并发保护才能真实生效。
+fn normalized_store_token(record: &Value, keys: &[&str]) -> String {
+    crate::crypto::strip_bearer(&crate::store::pick(record, keys))
 }
 
 // ─── 请求头 ────────────────────────────────────────────────────
@@ -1094,5 +1117,72 @@ fn checkin_report_of(claim: &Value) -> proto::CheckinReport {
         credit,
         streak: None,
         message,
+    }
+}
+
+// ─── 测试 ──────────────────────────────────────────────────────
+//
+// 锁定 issue #561 修复 6 的核心口径：落库守门比较与重读校验两侧的 Bearer
+// 前缀必须剥净，`previous`（credentials_from_record，裸 JWT）与
+// `store::pick`（落库原文，可能带前缀）才能相等 —— 否则刷新结果永不落库，
+// 每 24h 必掉线。并发保护语义（比较-再写）不在本层测（需要网关 ctx），
+// 由生产验收链路覆盖。
+#[cfg(test)]
+mod persist_refresh_normalization_tests {
+    use super::normalized_store_token;
+    use serde_json::{json, Value};
+
+    const JWT: &str = "eyJhbGciOiJub25lIn0.eyJ1c2VyX2lkIjoiMSJ9.sig";
+
+    #[test]
+    fn 落库带前缀时剥成裸token() {
+        let record: Value = json!({ "token": format!("Bearer {JWT}") });
+        assert_eq!(normalized_store_token(&record, &["token", "accessToken"]), JWT);
+    }
+
+    #[test]
+    fn 落库为裸值时恒等返回() {
+        let record: Value = json!({ "token": JWT });
+        assert_eq!(normalized_store_token(&record, &["token", "accessToken"]), JWT);
+    }
+
+    #[test]
+    fn 双前缀也能剥净() {
+        let record: Value = json!({ "token": format!("Bearer Bearer {JWT}") });
+        assert_eq!(normalized_store_token(&record, &["token", "accessToken"]), JWT);
+    }
+
+    #[test]
+    fn 前缀大小写不敏感() {
+        let record: Value = json!({ "token": format!("bearer {JWT}") });
+        assert_eq!(normalized_store_token(&record, &["token", "accessToken"]), JWT);
+    }
+
+    #[test]
+    fn accessToken回落键同样生效() {
+        let record: Value = json!({ "accessToken": format!("Bearer {JWT}") });
+        assert_eq!(normalized_store_token(&record, &["token", "accessToken"]), JWT);
+    }
+
+    #[test]
+    fn refreshToken同样剥前缀() {
+        let refresh = "rc_abcdef123456";
+        let record: Value = json!({ "refreshToken": format!("Bearer {refresh}") });
+        assert_eq!(normalized_store_token(&record, &["refreshToken"]), refresh);
+    }
+
+    #[test]
+    fn 键缺失或为空时返回空串() {
+        let empty: Value = json!({});
+        assert_eq!(normalized_store_token(&empty, &["token", "accessToken"]), "");
+        let blank: Value = json!({ "token": "   " });
+        assert_eq!(normalized_store_token(&blank, &["token", "accessToken"]), "");
+    }
+
+    #[test]
+    fn 只有前缀没有凭证时返回空串() {
+        // 防双前缀的关键分支：`Bearer ` 单独出现不是可用 token
+        let record: Value = json!({ "token": "Bearer " });
+        assert_eq!(normalized_store_token(&record, &["token", "accessToken"]), "");
     }
 }

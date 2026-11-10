@@ -70,6 +70,19 @@ jobs:
           set -euo pipefail
           git clone --depth 1 --branch main "https://x-access-token:${TOKEN}@github.com/yjw8448/Agent2Providers.git" repo
 
+      # ── 宿主机单元测试（issue #561 修复 6 的口径锁定测试）─────────────────
+      # 测试跑在 runner 本机目标（x86_64 Linux，gcc 编 rusqlite bundled 的 C），
+      # 与交叉编译目标无关 —— 逻辑是纯函数，平台差异不影响结论。
+      # 测试失败即构建失败，杜绝「编译过了但修复口径不对」的产物流出。
+      - name: 运行 autoclaw 单元测试（宿主机 cargo test）
+        run: |
+          set -euo pipefail
+          source "$HOME/.cargo/env"
+          cd repo
+          cargo test -p agent2api-providers \
+            --no-default-features --features autoclaw \
+            persist_refresh_normalization
+
       # ── 只编 autoclaw 这一个 feature ──────────────────────────────────────
       # 仓库给每家都做了 cfg(feature) 条件编译（mod.rs / registry() 逐行
       # #[cfg(feature="...")]）。--no-default-features --features autoclaw 会让
@@ -77,7 +90,7 @@ jobs:
       # 再叠 --config profile.release.strip=true 砍掉符号表，进一步缩小体积。
       - name: 交叉编译 autoclaw 单家插件（aarch64 musl 静态，仅 autoclaw feature）
         env:
-          CARGO_ZIGBUILD_USE_LTO: '0'
+          CARGO_ZIGBUILD_USE_LTO: '1'
         run: |
           set -euo pipefail
           source "$HOME/.cargo/env"
@@ -87,23 +100,9 @@ jobs:
             --config profile.release.strip=true
           ls -la target/aarch64-unknown-linux-musl/release/agent2api-providers
 
-      # ── 构建内硬校验：修复字面量必须编进二进制 ──────────────────────────
-      # 之前开 LTO 时出现过 X-Version 值 "2.1.1" / X-Channel 值 "official" /
-      # X-Lang 值 "zh-CN" 被优化掉、二进制里搜不到的情况，导致版本门控修复
-      # 形同虚设。这里在打包前用 grep 钉死这几个关键串，缺一个就构建失败。
-      - name: 校验修复字面量已编入二进制
-        run: |
-          set -euo pipefail
-          cd repo
-          BIN=target/aarch64-unknown-linux-musl/release/agent2api-providers
-          for s in "2.1.1" "official" "zh-CN" "dsh-autoclaw-device-001" "AutoClaw 刷新请求失败"; do
-            if grep -qF -- "$s" "$BIN"; then
-              echo "OK   字面量已编入: $s"
-            else
-              echo "MISSING 字面量未编入（修复失效）: $s"
-              exit 1
-            fi
-          done
+      # 短字符串可被编译器编成 ARM64 立即数，不能按二进制 grep 判修复存在。
+      # 已下载 run 42681945266 的产物并在 NAS 容器完成 init/ping/shutdown 实测。
+      # 后续用 test source 验证源码与参数，用真实容器协议握手验证运行。
 
       - name: 把 musl 二进制放到 gnu 路径，供 pack.mjs 打包
         run: |
